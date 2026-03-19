@@ -1,0 +1,457 @@
+---
+title: "End-to-End ML Pipeline - Diabetes Prediction"
+author: "Noelia Caba Martin"
+date: "2026-03-18"
+output: html_document
+---
+
+## Introduction
+
+This analysis demonstrates a complete, production-grade machine learning 
+pipeline for diabetes prediction using NHANES clinical data. Unlike basic 
+ML implementations, this project follows industry best practices including:
+
+- **Cross-validation** for robust model evaluation
+- **Proper preprocessing pipeline** to prevent data leakage
+- **Multiple evaluation metrics** including PR-AUC for imbalanced data
+- **Threshold tuning** optimized for clinical context
+- **Calibration analysis** to assess probability reliability
+
+**Why these practices matter:**
+In clinical applications, a poorly validated model can lead to incorrect 
+diagnoses. Cross-validation and proper evaluation metrics ensure that 
+reported performance reflects real-world behavior, not overfitting.
+
+**Research question:** Can we build a robust, well-validated model to 
+predict diabetes status from clinical variables, with performance metrics 
+appropriate for imbalanced clinical data?
+
+## Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+```{r libraries}
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(pROC)
+library(MLmetrics)
+library(precrec)
+library(themis)
+library(NHANES)
+library(ggplot2)
+```
+
+## Data Preparation
+```{r data-preparation}
+# Load and clean data
+set.seed(123)
+
+data(NHANES)
+
+nhanes_ml <- NHANES %>%
+  select(Gender, Age, Race1, BMI, BPSysAve,
+         BPDiaAve, TotChol, PhysActive,
+         SleepHrsNight, Diabetes) %>%
+  distinct() %>%
+  filter(!is.na(Diabetes)) %>%
+  filter(!is.na(BMI)) %>%
+  filter(!is.na(BPSysAve)) %>%
+  filter(!is.na(TotChol)) %>%
+  filter(!is.na(PhysActive)) %>%
+  drop_na()
+
+# Check dimensions and class balance
+dim(nhanes_ml)
+table(nhanes_ml$Diabetes)
+prop.table(table(nhanes_ml$Diabetes))
+
+# Split into training (70%) and test (20%)
+train_index <- createDataPartition(nhanes_ml$Diabetes,
+                                   p = 0.8,
+                                   list = FALSE)
+train_data <- nhanes_ml[train_index, ]
+test_data <- nhanes_ml[-train_index, ]
+
+cat("Training set:", nrow(train_data), "observations\n")
+cat("Test set:", nrow(test_data), "observations\n")
+```
+
+Data preparation was verified:
+
+- **No missing values** after cleaning ✓
+- **Class distribution preserved** in both training and test sets 
+(~89.5% No, ~10.5% Yes) ✓
+- **4,515 observations** with 10 variables retained ✓
+- Training set: **3,613 observations**, Test set: **902 observations** ✓
+
+The significant class imbalance (89.5% vs 10.5%) will be addressed 
+in the modeling pipeline using appropriate techniques.
+
+## Preprocessing Pipeline
+
+A key principle in professional ML pipelines is to **prevent data leakage** 
+— the accidental use of test data information during training. This is 
+avoided by defining a preprocessing pipeline that is fitted only on 
+training data and then applied to test data.
+
+Our pipeline includes:
+
+- **Centering and scaling** of numeric variables
+- **Dummy encoding** of categorical variables
+- **SMOTE** (Synthetic Minority Oversampling Technique) to address 
+class imbalance — generates synthetic samples of the minority class
+
+```{r preprocessing-pipeline}
+# Define preprocessing pipeline
+preprocess_pipeline <- preProcess(
+  train_data %>% select(-Diabetes),
+  method = c("center", "scale")
+)
+
+# Apply to training and test data
+train_processed <- predict(preprocess_pipeline, train_data)
+test_processed <- predict(preprocess_pipeline, test_data)
+
+# Verify scaling worked
+cat("Age mean after scaling:", round(mean(train_processed$Age), 3), "\n")
+cat("Age SD after scaling:", round(sd(train_processed$Age), 3), "\n")
+cat("BMI mean after scaling:", round(mean(train_processed$BMI), 3), "\n")
+cat("BMI SD after scaling:", round(sd(train_processed$BMI), 3), "\n")
+```
+
+The preprocessing pipeline was fitted exclusively on training data 
+and applied to both sets:
+
+- **Age:** mean = 0, SD = 1 after scaling ✓
+- **BMI:** mean = 0, SD = 1 after scaling ✓
+
+This confirms that centering and scaling worked correctly. By fitting 
+the pipeline only on training data, we ensure no information from 
+the test set influences the preprocessing — preventing data leakage.
+
+## Cross-Validation Setup
+
+Cross-validation is the cornerstone of robust model evaluation. 
+Instead of a single train/test split, **10-fold cross-validation** 
+repeatedly trains and evaluates the model on different subsets of 
+the training data, providing a more reliable estimate of real-world 
+performance.
+
+**Why 10-fold?**
+- 5-fold is faster but higher variance
+- 10-fold is the standard in clinical ML literature
+- Leave-one-out is too computationally expensive
+
+```{r cross-validation}
+# Define 10-fold cross-validation with stratification
+cv_control <- trainControl(
+  method = "cv",
+  number = 10,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final",
+  sampling = "smote"
+)
+
+# Train Random Forest with cross-validation
+set.seed(123)
+rf_cv <- train(
+  Diabetes ~ .,
+  data = train_processed,
+  method = "rf",
+  metric = "ROC",
+  trControl = cv_control,
+  tuneGrid = expand.grid(mtry = c(2, 3, 4, 5)),
+  ntree = 500
+)
+
+# Print results
+print(rf_cv)
+plot(rf_cv)
+```
+
+The 10-fold cross-validation with SMOTE and hyperparameter tuning 
+identified **mtry = 3** as the optimal number of randomly selected 
+predictors, achieving:
+
+- **ROC-AUC = 0.813** (cross-validated, unbiased estimate)
+- **Sensitivity = 0.923** (92.3% of diabetic cases detected)
+- **Specificity = 0.336**
+
+The cross-validated AUC of 0.813 is a more reliable estimate than 
+a simple train/test split, as it averages performance across 10 
+different data partitions. SMOTE was applied within each fold to 
+prevent data leakage while addressing class imbalance.
+
+## Model Evaluation on Test Set
+
+We now evaluate the final model on the held-out test set. This gives 
+an unbiased estimate of real-world performance since the test set 
+was never used during training or cross-validation.
+
+We calculate multiple metrics including **PR-AUC** (Precision-Recall 
+AUC), which is more informative than ROC-AUC for imbalanced datasets 
+because it focuses specifically on the minority class performance.
+
+```{r test-evaluation}
+# Predictions on test set
+rf_pred <- predict(rf_cv, test_processed)
+rf_prob <- predict(rf_cv, test_processed, type = "prob")[, "Yes"]
+
+# Confusion matrix
+conf_matrix <- confusionMatrix(rf_pred, test_processed$Diabetes,
+                                positive = "Yes")
+print(conf_matrix)
+
+# ROC-AUC
+roc_obj <- roc(test_processed$Diabetes, rf_prob)
+cat("ROC-AUC:", round(pROC::auc(roc_obj), 3), "\n")
+
+# PR-AUC
+pr_obj <- evalmod(
+  scores = rf_prob,
+  labels = ifelse(test_processed$Diabetes == "Yes", 1, 0)
+)
+pr_aucs <- auc(pr_obj)
+cat("PR-AUC:", round(pr_aucs[pr_aucs$curvetypes == "PRC", "aucs"], 3), "\n")
+
+# F1 Score
+f1 <- F1_Score(
+  y_pred = rf_pred,
+  y_true = test_processed$Diabetes,
+  positive = "Yes"
+)
+cat("F1 Score:", round(f1, 3), "\n")
+```
+
+The model evaluation on the held-out test set reveals:
+
+| Metric | Value |
+|---|---|
+| ROC-AUC | 0.788 |
+| PR-AUC | 0.282 |
+| Sensitivity | 44.2% |
+| Specificity | 89.9% |
+| F1 Score | 0.385 |
+| Kappa | 0.302 |
+
+The **PR-AUC of 0.282** is substantially above the baseline of 0.105 
+(random classifier = class prevalence), indicating meaningful 
+predictive ability for the minority class.
+
+However, **sensitivity of 44.2%** is clinically concerning — the model 
+misses more than half of diabetic cases at the default threshold of 0.5. 
+This motivates threshold tuning to optimize for clinical utility.
+
+## Threshold Tuning
+
+```{r threshold-tuning}
+# Calculate metrics at different thresholds
+thresholds <- seq(0.1, 0.9, by = 0.05)
+
+threshold_results <- data.frame(
+  threshold = thresholds,
+  sensitivity = NA,
+  specificity = NA,
+  f1 = NA
+)
+
+for(i in seq_along(thresholds)) {
+  pred_thresh <- factor(
+    ifelse(rf_prob > thresholds[i], "Yes", "No"),
+    levels = c("No", "Yes")
+  )
+  cm <- confusionMatrix(pred_thresh, test_processed$Diabetes,
+                        positive = "Yes")
+  threshold_results$sensitivity[i] <- cm$byClass["Sensitivity"]
+  threshold_results$specificity[i] <- cm$byClass["Specificity"]
+  threshold_results$f1[i] <- F1_Score(
+    y_pred = pred_thresh,
+    y_true = test_processed$Diabetes,
+    positive = "Yes"
+  )
+}
+
+# Find optimal threshold
+optimal_threshold <- threshold_results$threshold[which.max(threshold_results$f1)]
+cat("Optimal threshold:", optimal_threshold, "\n")
+cat("F1 at optimal threshold:", round(max(threshold_results$f1), 3), "\n")
+
+# Plot threshold vs metrics
+threshold_results %>%
+  pivot_longer(-threshold, names_to = "metric", values_to = "value") %>%
+  ggplot(aes(x = threshold, y = value, color = metric)) +
+  geom_line(size = 1) +
+  geom_vline(xintercept = optimal_threshold, 
+             linetype = "dashed", color = "black") +
+  scale_color_manual(values = c("#E64B35", "#2E9FDF", "#00A087")) +
+  theme_minimal() +
+  labs(title = "Threshold Tuning - Sensitivity, Specificity and F1",
+       x = "Threshold", y = "Value", color = "Metric")
+```
+
+The threshold tuning analysis reveals the trade-off between sensitivity 
+and specificity across different classification thresholds:
+
+- At **low thresholds** (< 0.3): high sensitivity but very low specificity 
+— many false positives
+- At **high thresholds** (> 0.7): high specificity but very low sensitivity 
+— many missed cases
+- The **optimal threshold for F1 = 0.5**, confirming that the default 
+threshold performs reasonably well for this dataset
+
+In a clinical screening context, a lower threshold (e.g. 0.3) might 
+be preferred to maximize sensitivity — ensuring that most diabetic 
+cases are detected, even at the cost of more false positives.
+
+## PR Curve and ROC Curve
+
+We visualize both the ROC curve and the Precision-Recall curve 
+together to get a complete picture of model performance.
+
+The **ROC curve** shows the trade-off between sensitivity and 
+1-specificity across all thresholds.
+
+The **PR curve** shows the trade-off between precision and recall, 
+and is more informative for imbalanced datasets because it focuses 
+on the minority class performance.
+
+```{r roc-pr-curves}
+# ROC curve
+roc_plot <- ggroc(roc_obj, color = "#E64B35", size = 1) +
+  geom_abline(slope = 1, intercept = 1, 
+              linetype = "dashed", color = "grey") +
+  theme_minimal() +
+  labs(title = paste("ROC Curve - AUC:", round(pROC::auc(roc_obj), 3)),
+       x = "Specificity", y = "Sensitivity")
+
+# PR curve
+autoplot(pr_obj, curvetype = "PRC") +
+  theme_minimal() +
+  labs(title = "Precision-Recall Curve",
+       x = "Recall", y = "Precision")
+
+print(roc_plot)
+```
+
+**ROC Curve (AUC = 0.788):** the model shows good overall discriminative 
+ability, substantially above random classification (AUC = 0.5).
+
+**Precision-Recall Curve (PR-AUC = 0.282):** the curve is substantially 
+above the baseline of 0.105 (random classifier = class prevalence), 
+confirming meaningful predictive ability for diabetic cases.
+
+The PR curve reveals the fundamental challenge of this dataset: as 
+recall increases (detecting more diabetic cases), precision decreases 
+(more false positives). This trade-off is inherent to imbalanced 
+classification and must be considered when deploying the model clinically.
+
+## Calibration Analysis
+
+A well-performing model should not only classify correctly but also 
+produce **reliable probability estimates**. For example, when the model 
+says a patient has 70% probability of diabetes, approximately 70% of 
+such patients should actually have diabetes.
+
+A **calibration curve** (reliability diagram) plots predicted 
+probabilities against observed frequencies. A perfectly calibrated 
+model follows the diagonal line.
+
+```{r calibration}
+# Create calibration data
+cal_data <- data.frame(
+  prob = rf_prob,
+  actual = ifelse(test_processed$Diabetes == "Yes", 1, 0)
+)
+
+# Bin probabilities
+cal_data$bin <- cut(cal_data$prob, 
+                    breaks = seq(0, 1, by = 0.1),
+                    include.lowest = TRUE)
+
+# Calculate observed frequency per bin
+cal_summary <- cal_data %>%
+  group_by(bin) %>%
+  summarise(
+    mean_prob = mean(prob),
+    observed_freq = mean(actual),
+    n = n()
+  ) %>%
+  filter(!is.na(bin))
+
+# Plot calibration curve
+ggplot(cal_summary, aes(x = mean_prob, y = observed_freq)) +
+  geom_point(aes(size = n), color = "#E64B35", alpha = 0.8) +
+  geom_line(color = "#E64B35") +
+  geom_abline(slope = 1, intercept = 0, 
+              linetype = "dashed", color = "grey") +
+  theme_minimal() +
+  labs(title = "Calibration Curve",
+       subtitle = "Predicted probability vs observed frequency",
+       x = "Mean predicted probability",
+       y = "Observed frequency",
+       size = "N patients")
+```
+
+The calibration curve reveals that the model is **reasonably calibrated** 
+at low probability ranges (0.0-0.4), where most predictions fall. 
+
+At higher probability ranges (0.6-0.8), the calibration is less reliable 
+due to the small number of patients in those bins — a consequence of 
+the class imbalance.
+
+Overall, the model tends to slightly underestimate probabilities for 
+high-risk patients, which is a common characteristic of Random Forest 
+models that can be addressed with Platt scaling or isotonic regression 
+in future work.
+
+## Conclusions
+
+This analysis demonstrates a complete, production-grade machine learning 
+pipeline for diabetes prediction, following industry best practices 
+that are often missing from basic ML implementations.
+
+**Key methodological contributions:**
+
+1. **Cross-validation with SMOTE** was applied correctly within each 
+fold, preventing data leakage while addressing class imbalance. The 
+cross-validated ROC-AUC of 0.813 provides a reliable, unbiased 
+estimate of real-world performance.
+
+2. **Hyperparameter tuning** identified mtry = 3 as the optimal 
+number of randomly selected predictors, demonstrating systematic 
+model selection rather than arbitrary parameter choice.
+
+3. **Multiple evaluation metrics** were used including ROC-AUC (0.788), 
+PR-AUC (0.282) and F1 Score (0.385), providing a complete picture 
+of model performance for imbalanced data.
+
+4. **Threshold tuning** revealed that the optimal threshold for F1 
+is 0.5, but a lower threshold (0.3) would be more appropriate for 
+clinical screening where missing a positive case is more costly 
+than a false alarm.
+
+5. **PR-AUC of 0.282** is substantially above the baseline of 0.105, 
+confirming meaningful predictive ability for the minority class 
+despite the significant class imbalance.
+
+**Limitations:**
+
+- Sensitivity of 44.2% at the default threshold indicates the model 
+still misses more than half of diabetic cases — further improvement 
+is needed for clinical deployment
+- The dataset contains only basic clinical variables — adding HbA1c 
+or fasting glucose would likely substantially improve performance
+- External validation on an independent dataset is required before 
+clinical use
+
+**Future directions:**
+
+- Implement SMOTE oversampling as a standalone project with 
+comprehensive comparison of resampling strategies
+- Explore gradient boosting methods with extensive hyperparameter tuning
+- Add calibration analysis to assess probability reliability
+- Validate on an independent clinical cohort
+- Apply Platt scaling or isotonic regression to improve probability 
+calibration at high risk ranges
